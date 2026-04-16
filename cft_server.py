@@ -501,14 +501,35 @@ try:
         result = await upload(UploadRequest(repo_name=repo_name))
         return json.dumps(result)
 
-    # Mount MCP onto FastAPI using ModelContextProtocol in startup event
-    from mcp.server.fastapi import ModelContextProtocol
+    # Mount MCP SSE transport onto FastAPI
+    from mcp.server.sse import SseServerTransport
+    from starlette.requests import Request
+    from starlette.responses import Response
 
-    @app.on_event('startup')
-    async def startup_mcp():
-        mcp_handler = ModelContextProtocol(mcp)
-        app.mount('/mcp', mcp_handler.app)
+    sse = SseServerTransport('/mcp/messages/')
+    _low = mcp._mcp_server if hasattr(mcp, '_mcp_server') else mcp._server if hasattr(mcp, '_server') else None
+
+    if _low is None:
+        # Fallback: try to get the server from the FastMCP internals
+        for attr in dir(mcp):
+            obj = getattr(mcp, attr, None)
+            if hasattr(obj, 'run') and hasattr(obj, 'create_initialization_options'):
+                _low = obj
+                break
+
+    if _low:
+        @app.get('/mcp/sse')
+        async def handle_sse(request: Request):
+            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+                await _low.run(streams[0], streams[1], _low.create_initialization_options())
+
+        @app.post('/mcp/messages/')
+        async def handle_messages(request: Request):
+            await sse.handle_post_message(request.scope, request.receive, request._send)
+
         print('MCP server enabled at /mcp/sse')
+    else:
+        print('WARNING: Could not find MCP low-level server. MCP disabled. REST API still works.')
 except ImportError:
     print('MCP SDK not installed — MCP endpoints disabled. Install with: pip install "mcp[server]"')
 
