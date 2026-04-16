@@ -455,60 +455,55 @@ async def history():
 
 # ── MCP Server (for Auto Chat — AI judge connects via MCP protocol) ──
 try:
-    from mcp.server import Server as McpServer
-    from mcp.types import Tool, TextContent
-    from starlette.responses import Response
-    from starlette.requests import Request
-    import asyncio
+    from mcp.server.fastmcp import FastMCP
 
-    mcp_server = McpServer('cft-trainer')
+    mcp = FastMCP('CFT-Judge-Server')
 
-    @mcp_server.list_tools()
-    async def mcp_list_tools():
-        return [
-            Tool(name='cft_chat', description='Send a message to the training model and get its response', inputSchema={'type': 'object', 'properties': {'message': {'type': 'string', 'description': 'The prompt to send to the model'}}, 'required': ['message']}),
-            Tool(name='cft_run_code', description='Execute code on the server and return stdout/stderr/exit_code', inputSchema={'type': 'object', 'properties': {'language': {'type': 'string', 'enum': ['python', 'javascript', 'bash'], 'description': 'Programming language'}, 'code': {'type': 'string', 'description': 'Code to execute'}}, 'required': ['language', 'code']}),
-            Tool(name='cft_score', description='Score the last model response 1-10. Triggers a LoRA training step.', inputSchema={'type': 'object', 'properties': {'score': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'description': 'Score from 1 (terrible) to 10 (perfect)'}}, 'required': ['score']}),
-            Tool(name='cft_correct', description='Provide the correct answer. Trains the model on it as a positive example.', inputSchema={'type': 'object', 'properties': {'correction': {'type': 'string', 'description': 'The correct answer or fixed code'}}, 'required': ['correction']}),
-            Tool(name='cft_status', description='Get training stats: step count, avg score, total messages', inputSchema={'type': 'object', 'properties': {}}),
-            Tool(name='cft_stop', description='Stop training and save the LoRA adapter checkpoint', inputSchema={'type': 'object', 'properties': {}}),
-            Tool(name='cft_upload', description='Upload the saved adapter to HuggingFace', inputSchema={'type': 'object', 'properties': {'repo_name': {'type': 'string', 'description': 'HuggingFace repo like username/model-name'}}, 'required': ['repo_name']}),
-        ]
+    @mcp.tool()
+    async def cft_chat(message: str) -> str:
+        """Send a message to the training model and get its response."""
+        result = await chat(ChatRequest(message=message))
+        return json.dumps(result)
 
-    @mcp_server.call_tool()
-    async def mcp_call_tool(name: str, arguments: dict):
-        if name == 'cft_chat':
-            result = await chat(ChatRequest(message=arguments['message']))
-        elif name == 'cft_run_code':
-            result = await run_code(RunCodeRequest(language=arguments['language'], code=arguments['code']))
-        elif name == 'cft_score':
-            result = await score(ScoreRequest(score=arguments['score']))
-        elif name == 'cft_correct':
-            result = await correct(CorrectRequest(correction=arguments['correction']))
-        elif name == 'cft_status':
-            result = await status()
-        elif name == 'cft_stop':
-            result = await stop_training()
-        elif name == 'cft_upload':
-            result = await upload(UploadRequest(repo_name=arguments['repo_name']))
-        else:
-            return [TextContent(type='text', text=f'Unknown tool: {name}')]
-        return [TextContent(type='text', text=json.dumps(result))]
+    @mcp.tool()
+    async def cft_run_code(language: str, code: str) -> str:
+        """Execute python, javascript, or bash code and return the output."""
+        result = await run_code(RunCodeRequest(language=language, code=code))
+        return f"STDOUT: {result['stdout']}\nSTDERR: {result['stderr']}\nEXIT_CODE: {result['exit_code']}"
 
-    # Mount MCP SSE transport on FastAPI
-    from mcp.server.sse import SseServerTransport
-    sse_transport = SseServerTransport('/mcp/messages/')
+    @mcp.tool()
+    async def cft_score(score_value: int) -> str:
+        """Score the last model response 1-10. Triggers a LoRA training step."""
+        result = await score(ScoreRequest(score=score_value))
+        return json.dumps(result)
 
-    @app.get('/mcp/sse')
-    async def mcp_sse_endpoint(request: Request):
-        async with sse_transport.connect_sse(request.scope, request.receive, request._send) as streams:
-            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+    @mcp.tool()
+    async def cft_correct(correction: str) -> str:
+        """Provide the correct answer. Trains the model on it as a positive example."""
+        result = await correct(CorrectRequest(correction=correction))
+        return json.dumps(result)
 
-    @app.post('/mcp/messages/')
-    async def mcp_messages_endpoint(request: Request):
-        await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+    @mcp.tool()
+    async def cft_status() -> str:
+        """Get training stats: step count, avg score, total messages."""
+        result = await status()
+        return json.dumps(result)
 
-    print('MCP server enabled at /mcp/sse')
+    @mcp.tool()
+    async def cft_stop() -> str:
+        """Stop training and save the LoRA adapter checkpoint."""
+        result = await stop_training()
+        return json.dumps(result)
+
+    @mcp.tool()
+    async def cft_upload(repo_name: str) -> str:
+        """Upload the saved adapter to HuggingFace."""
+        result = await upload(UploadRequest(repo_name=repo_name))
+        return json.dumps(result)
+
+    # Mount MCP onto FastAPI — creates /mcp/sse and /mcp/messages/ automatically
+    mcp.mount_to(app)
+    print('MCP server enabled (FastMCP mounted at /mcp/sse)')
 except ImportError:
     print('MCP SDK not installed — MCP endpoints disabled. Install with: pip install "mcp[server]"')
 
