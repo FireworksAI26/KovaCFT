@@ -501,22 +501,14 @@ try:
         result = await upload(UploadRequest(repo_name=repo_name))
         return json.dumps(result)
 
-    # Mount MCP SSE transport onto FastAPI manually
-    from mcp.server.sse import SseServerTransport
-    from starlette.requests import Request
+    # Mount MCP onto FastAPI using ModelContextProtocol in startup event
+    from mcp.server.fastapi import ModelContextProtocol
 
-    sse_transport = SseServerTransport('/mcp/messages/')
-
-    @app.get('/mcp/sse')
-    async def mcp_sse_endpoint(request: Request):
-        async with sse_transport.connect_sse(request.scope, request.receive, request._send) as streams:
-            await mcp._mcp_server.run(streams[0], streams[1], mcp._mcp_server.create_initialization_options())
-
-    @app.post('/mcp/messages/')
-    async def mcp_messages_endpoint(request: Request):
-        await sse_transport.handle_post_message(request.scope, request.receive, request._send)
-
-    print('MCP server enabled at /mcp/sse')
+    @app.on_event('startup')
+    async def startup_mcp():
+        mcp_handler = ModelContextProtocol(mcp)
+        app.mount('/mcp', mcp_handler.app)
+        print('MCP server enabled at /mcp/sse')
 except ImportError:
     print('MCP SDK not installed — MCP endpoints disabled. Install with: pip install "mcp[server]"')
 
