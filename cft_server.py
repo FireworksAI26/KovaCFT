@@ -51,6 +51,16 @@ class CorrectRequest(BaseModel):
 class UploadRequest(BaseModel):
     repo_name: str
 
+class RunCodeRequest(BaseModel):
+    language: str  # python, javascript, bash
+    code: str
+    timeout: int = 30
+
+class AutoTrainRequest(BaseModel):
+    focus: str = 'general'  # react, python, javascript, etc.
+    rounds: int = 20
+    method: str = 'code_execution'  # code_execution, ai_judge, both
+
 # ── Load model on startup ──
 @app.on_event('startup')
 async def load_model():
@@ -173,6 +183,334 @@ async def resume_training():
     global training_active
     training_active = True
     return {'status': 'resumed'}
+
+# ── Run Code endpoint (for Auto Chat) ──
+@app.post('/run_code')
+async def run_code(req: RunCodeRequest):
+    import subprocess, tempfile
+    try:
+        if req.language == 'python':
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(req.code)
+                f.flush()
+                result = subprocess.run(['python', f.name], capture_output=True, text=True, timeout=req.timeout)
+        elif req.language in ('javascript', 'typescript'):
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+                f.write(req.code)
+                f.flush()
+                result = subprocess.run(['node', f.name], capture_output=True, text=True, timeout=req.timeout)
+        elif req.language == 'bash':
+            result = subprocess.run(['bash', '-c', req.code], capture_output=True, text=True, timeout=req.timeout)
+        else:
+            return {'stdout': '', 'stderr': f'Unsupported language: {req.language}', 'exit_code': 1, 'error': 'unsupported_language'}
+        return {'stdout': result.stdout[:5000], 'stderr': result.stderr[:5000], 'exit_code': result.returncode, 'error': None}
+    except subprocess.TimeoutExpired:
+        return {'stdout': '', 'stderr': 'Execution timed out', 'exit_code': 1, 'error': 'timeout'}
+    except Exception as e:
+        return {'stdout': '', 'stderr': str(e), 'exit_code': 1, 'error': str(e)}
+
+# ── Auto Train state ──
+auto_train_active = False
+auto_train_paused = False
+auto_round = 0
+auto_total_rounds = 0
+auto_pass_count = 0
+auto_exchanges = []
+auto_focus = 'general'
+auto_method = 'code_execution'
+
+PROMPT_TEMPLATES = {
+    'react': [
+        'Build a React component for a responsive navbar with mobile hamburger menu using Tailwind CSS.',
+        'Create a React hook called useDebounce that debounces a value with a configurable delay.',
+        'Build a React todo app with add, delete, and toggle complete. Use useState and Tailwind.',
+        'Create a React modal component that closes on overlay click and Escape key press.',
+        'Build a React form with email and password validation, showing inline error messages.',
+        'Create a React dark mode toggle that persists the preference in localStorage.',
+        'Build a React accordion component where only one section can be open at a time.',
+        'Create a responsive React pricing page with 3 tiers using Tailwind CSS grid.',
+        'Build a React infinite scroll component that loads more items when reaching the bottom.',
+        'Create a React search bar with live filtering of a list of items.',
+    ],
+    'python': [
+        'Write a Python function that finds all prime numbers up to n using the Sieve of Eratosthenes.',
+        'Create a Python class for a binary search tree with insert, search, and delete methods.',
+        'Write a Python script that reads a CSV file and outputs statistics (mean, median, mode) for each numeric column.',
+        'Implement a Python LRU cache from scratch without using functools.',
+        'Write a Python async web scraper that fetches 5 URLs concurrently using aiohttp.',
+        'Create a Python decorator that retries a function up to 3 times with exponential backoff.',
+        'Write a Python function to flatten a deeply nested dictionary into dot-notation keys.',
+        'Implement merge sort in Python with type hints.',
+        'Write a Python context manager for timing code execution.',
+        'Create a Python dataclass for a REST API response with validation.',
+    ],
+    'javascript': [
+        'Write a debounce function in JavaScript that handles both leading and trailing edge calls.',
+        'Implement a simple Promise.all from scratch in JavaScript.',
+        'Write a JavaScript function that deep clones an object, handling circular references.',
+        'Create a JavaScript event emitter class with on, off, and emit methods.',
+        'Write a JavaScript function to convert a nested object to a flat object with dot-notation keys.',
+        'Implement a basic pub/sub system in JavaScript.',
+        'Write a JavaScript function to detect if two rectangles overlap.',
+        'Create a throttle function in JavaScript.',
+        'Write a JavaScript function that groups an array of objects by a key.',
+        'Implement a basic router in vanilla JavaScript for single-page apps.',
+    ],
+    'general': [
+        'Write a Python function to check if a string is a valid palindrome, ignoring non-alphanumeric characters.',
+        'Build a simple React counter component with increment, decrement, and reset buttons.',
+        'Write a JavaScript function that converts a number to Roman numerals.',
+        'Create a Python script that generates a random password with configurable length and character types.',
+        'Write a bash script that monitors a directory for new files and logs their names.',
+        'Build a React component that fetches data from an API and displays it in a table.',
+        'Write a Python function to find the longest common subsequence of two strings.',
+        'Create a JavaScript class for a simple linked list with add, remove, and find methods.',
+        'Write a Python function that validates an email address using regex.',
+        'Build a React form that calculates BMI from height and weight inputs.',
+    ],
+}
+
+def _get_prompts(focus: str) -> list:
+    return PROMPT_TEMPLATES.get(focus, PROMPT_TEMPLATES['general'])
+
+def _extract_code(response: str) -> tuple:
+    """Extract code block and language from model response."""
+    import re as _re
+    # Match ```language\ncode\n```
+    match = _re.search(r'```(\w+)?\n(.*?)```', response, _re.DOTALL)
+    if match:
+        lang = match.group(1) or 'python'
+        code = match.group(2).strip()
+        # Map common language names
+        lang_map = {'tsx': 'javascript', 'ts': 'javascript', 'jsx': 'javascript', 'js': 'javascript', 'py': 'python', 'sh': 'bash'}
+        lang = lang_map.get(lang, lang)
+        return lang, code
+    return None, None
+
+def _auto_score_code(stdout: str, stderr: str, exit_code: int) -> int:
+    """Auto-score based on code execution result."""
+    if exit_code == 0 and not stderr:
+        return 8  # Clean execution
+    elif exit_code == 0 and stderr:
+        return 6  # Runs but warnings
+    elif 'SyntaxError' in stderr or 'TypeError' in stderr:
+        return 2  # Basic errors
+    else:
+        return 3  # Runtime errors
+
+# ── Auto Train endpoints ──
+@app.post('/auto_train')
+async def auto_train(req: AutoTrainRequest):
+    global auto_train_active, auto_train_paused, auto_round, auto_total_rounds
+    global auto_pass_count, auto_exchanges, auto_focus, auto_method
+    if auto_train_active:
+        raise HTTPException(400, 'Auto training already running')
+    auto_train_active = True
+    auto_train_paused = False
+    auto_round = 0
+    auto_total_rounds = req.rounds
+    auto_pass_count = 0
+    auto_exchanges = []
+    auto_focus = req.focus
+    auto_method = req.method
+    # Start auto training in background
+    import asyncio
+    asyncio.create_task(_run_auto_train())
+    return {'status': 'started', 'focus': req.focus, 'rounds': req.rounds}
+
+async def _run_auto_train():
+    global auto_train_active, auto_train_paused, auto_round, auto_pass_count, auto_exchanges, step
+    import asyncio, random
+    prompts = _get_prompts(auto_focus)
+    for i in range(auto_total_rounds):
+        if not auto_train_active:
+            break
+        while auto_train_paused:
+            await asyncio.sleep(1)
+            if not auto_train_active:
+                return
+        auto_round = i + 1
+        prompt = prompts[i % len(prompts)] if i < len(prompts) else random.choice(prompts)
+        # Get model response
+        with model_lock:
+            conversation.append({'role': 'user', 'content': prompt})
+            p = _build_prompt(conversation)
+            inputs = tokenizer(p, return_tensors='pt', truncation=True, max_length=2048).to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(**inputs, max_new_tokens=1024, do_sample=True, temperature=0.7, top_p=0.9, pad_token_id=tokenizer.pad_token_id)
+            response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+            conversation.append({'role': 'assistant', 'content': response})
+        # Try to run code
+        lang, code = _extract_code(response)
+        exec_result = None
+        auto_score = 5
+        reason = 'No code found in response'
+        if lang and code:
+            try:
+                import subprocess, tempfile
+                if lang == 'python':
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                        f.write(code); f.flush()
+                        result = subprocess.run(['python', f.name], capture_output=True, text=True, timeout=30)
+                elif lang in ('javascript',):
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+                        f.write(code); f.flush()
+                        result = subprocess.run(['node', f.name], capture_output=True, text=True, timeout=30)
+                elif lang == 'bash':
+                    result = subprocess.run(['bash', '-c', code], capture_output=True, text=True, timeout=30)
+                else:
+                    result = None
+                if result:
+                    exec_result = {'stdout': result.stdout[:2000], 'stderr': result.stderr[:2000], 'exit_code': result.returncode}
+                    auto_score = _auto_score_code(result.stdout, result.stderr, result.returncode)
+                    if result.returncode == 0:
+                        auto_pass_count += 1
+                        reason = 'Code executed successfully'
+                    else:
+                        reason = f'Runtime error: {result.stderr[:200]}'
+            except subprocess.TimeoutExpired:
+                exec_result = {'stdout': '', 'stderr': 'Timeout', 'exit_code': 1}
+                auto_score = 3
+                reason = 'Code execution timed out'
+            except Exception as e:
+                exec_result = {'stdout': '', 'stderr': str(e), 'exit_code': 1}
+                auto_score = 4
+                reason = str(e)[:200]
+        # Train on the score
+        with model_lock:
+            reward = _compute_reward(auto_score)
+            _train_step(reward)
+            scores_history.append({'score': auto_score, 'reward': reward, 'step': step})
+        exchange = {
+            'round': auto_round,
+            'prompt': prompt[:200],
+            'response': response[:500],
+            'score': auto_score,
+            'reason': reason,
+            'code_executed': exec_result is not None,
+            'passed': exec_result['exit_code'] == 0 if exec_result else False,
+        }
+        auto_exchanges.append(exchange)
+        # Keep only last 50 exchanges in memory
+        if len(auto_exchanges) > 50:
+            auto_exchanges = auto_exchanges[-50:]
+        await asyncio.sleep(0.5)  # Small delay between rounds
+    auto_train_active = False
+
+@app.get('/auto_status')
+async def auto_status():
+    avg = np.mean([s['score'] for s in scores_history[-20:]]) if scores_history else 0
+    pass_rate = auto_pass_count / auto_round if auto_round > 0 else 0
+    return {
+        'running': auto_train_active,
+        'paused': auto_train_paused,
+        'round': auto_round,
+        'total_rounds': auto_total_rounds,
+        'avg_score': round(float(avg), 1),
+        'pass_rate': round(pass_rate, 2),
+        'focus': auto_focus,
+        'method': auto_method,
+        'exchanges': auto_exchanges[-5:],
+        'step': step,
+    }
+
+@app.post('/auto_pause')
+async def auto_pause():
+    global auto_train_paused
+    auto_train_paused = True
+    return {'status': 'paused'}
+
+@app.post('/auto_resume')
+async def auto_resume_training():
+    global auto_train_paused
+    auto_train_paused = False
+    return {'status': 'resumed'}
+
+@app.post('/auto_stop')
+async def auto_stop():
+    global auto_train_active
+    auto_train_active = False
+    return {'status': 'stopped', 'rounds_completed': auto_round, 'step': step}
+
+# ── History endpoint (for Auto Chat live feed) ──
+@app.get('/history')
+async def history():
+    exchanges = []
+    i = 0
+    score_idx = 0
+    while i < len(conversation) - 1:
+        if conversation[i]['role'] == 'user' and i + 1 < len(conversation) and conversation[i + 1]['role'] == 'assistant':
+            ex = {
+                'prompt': conversation[i]['content'][:300],
+                'response': conversation[i + 1]['content'][:500],
+                'score': scores_history[score_idx]['score'] if score_idx < len(scores_history) else None,
+                'step': scores_history[score_idx].get('step') if score_idx < len(scores_history) else None,
+            }
+            exchanges.append(ex)
+            score_idx += 1
+            i += 2
+        else:
+            i += 1
+    return {'exchanges': exchanges[-20:]}
+
+# ── MCP Server (for Auto Chat — AI judge connects via MCP protocol) ──
+try:
+    from mcp.server import Server as McpServer
+    from mcp.types import Tool, TextContent
+    from starlette.responses import Response
+    from starlette.requests import Request
+    import asyncio
+
+    mcp_server = McpServer('cft-trainer')
+
+    @mcp_server.list_tools()
+    async def mcp_list_tools():
+        return [
+            Tool(name='cft_chat', description='Send a message to the training model and get its response', inputSchema={'type': 'object', 'properties': {'message': {'type': 'string', 'description': 'The prompt to send to the model'}}, 'required': ['message']}),
+            Tool(name='cft_run_code', description='Execute code on the server and return stdout/stderr/exit_code', inputSchema={'type': 'object', 'properties': {'language': {'type': 'string', 'enum': ['python', 'javascript', 'bash'], 'description': 'Programming language'}, 'code': {'type': 'string', 'description': 'Code to execute'}}, 'required': ['language', 'code']}),
+            Tool(name='cft_score', description='Score the last model response 1-10. Triggers a LoRA training step.', inputSchema={'type': 'object', 'properties': {'score': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'description': 'Score from 1 (terrible) to 10 (perfect)'}}, 'required': ['score']}),
+            Tool(name='cft_correct', description='Provide the correct answer. Trains the model on it as a positive example.', inputSchema={'type': 'object', 'properties': {'correction': {'type': 'string', 'description': 'The correct answer or fixed code'}}, 'required': ['correction']}),
+            Tool(name='cft_status', description='Get training stats: step count, avg score, total messages', inputSchema={'type': 'object', 'properties': {}}),
+            Tool(name='cft_stop', description='Stop training and save the LoRA adapter checkpoint', inputSchema={'type': 'object', 'properties': {}}),
+            Tool(name='cft_upload', description='Upload the saved adapter to HuggingFace', inputSchema={'type': 'object', 'properties': {'repo_name': {'type': 'string', 'description': 'HuggingFace repo like username/model-name'}}, 'required': ['repo_name']}),
+        ]
+
+    @mcp_server.call_tool()
+    async def mcp_call_tool(name: str, arguments: dict):
+        if name == 'cft_chat':
+            result = await chat(ChatRequest(message=arguments['message']))
+        elif name == 'cft_run_code':
+            result = await run_code(RunCodeRequest(language=arguments['language'], code=arguments['code']))
+        elif name == 'cft_score':
+            result = await score(ScoreRequest(score=arguments['score']))
+        elif name == 'cft_correct':
+            result = await correct(CorrectRequest(correction=arguments['correction']))
+        elif name == 'cft_status':
+            result = await status()
+        elif name == 'cft_stop':
+            result = await stop_training()
+        elif name == 'cft_upload':
+            result = await upload(UploadRequest(repo_name=arguments['repo_name']))
+        else:
+            return [TextContent(type='text', text=f'Unknown tool: {name}')]
+        return [TextContent(type='text', text=json.dumps(result))]
+
+    # Mount MCP SSE transport on FastAPI
+    from mcp.server.sse import SseServerTransport
+    sse_transport = SseServerTransport('/mcp/messages/')
+
+    @app.get('/mcp/sse')
+    async def mcp_sse_endpoint(request: Request):
+        async with sse_transport.connect_sse(request.scope, request.receive, request._send) as streams:
+            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+
+    @app.post('/mcp/messages/')
+    async def mcp_messages_endpoint(request: Request):
+        await sse_transport.handle_post_message(request.scope, request.receive, request._send)
+
+    print('MCP server enabled at /mcp/sse')
+except ImportError:
+    print('MCP SDK not installed — MCP endpoints disabled. Install with: pip install "mcp[server]"')
 
 # ── Upload endpoint ──
 @app.post('/upload')
