@@ -523,8 +523,17 @@ try:
             async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
                 await _low.run(streams[0], streams[1], _low.create_initialization_options())
 
+        @app.post('/mcp/sse')
+        async def handle_sse_post(request: Request):
+            """Some MCP clients POST to /mcp/sse for initialization. Redirect to messages endpoint."""
+            await sse.handle_post_message(request.scope, request.receive, request._send)
+
         @app.post('/mcp/messages/')
         async def handle_messages(request: Request):
+            await sse.handle_post_message(request.scope, request.receive, request._send)
+
+        @app.post('/mcp/messages')
+        async def handle_messages_no_slash(request: Request):
             await sse.handle_post_message(request.scope, request.receive, request._send)
 
         print('MCP server enabled at /mcp/sse')
