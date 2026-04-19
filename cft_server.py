@@ -15,7 +15,7 @@ from peft import LoraConfig, get_peft_model, PeftModel
 import uvicorn
 
 # ── Config ──
-BASE_MODEL = os.environ.get('BASE_MODEL_ID', 'Qwen/Qwen3.5-4B')
+BASE_MODEL = os.environ.get('BASE_MODEL_ID', 'Qwen/Qwen3.6-35B-A3B')
 CHECKPOINT_DIR = os.environ.get('CFT_CHECKPOINT', '/root/cft-checkpoints')
 PORT = int(os.environ.get('CFT_PORT', '7860'))
 LR = float(os.environ.get('CFT_LR', '1e-5'))
@@ -562,15 +562,23 @@ def _compute_reward(score_1_to_10: int) -> float:
     return (score_1_to_10 - 5.5) / 4.5  # 1→-1.0, 5→-0.11, 6→0.11, 10→1.0
 
 def _build_prompt(conv: list) -> str:
-    """Build a chat prompt from conversation history."""
-    parts = []
-    for msg in conv[-10:]:  # Last 10 messages for context
-        if msg['role'] == 'user':
-            parts.append(f"User: {msg['content']}")
-        else:
-            parts.append(f"Assistant: {msg['content']}")
-    parts.append('Assistant:')
-    return '\n'.join(parts)
+    """Build a chat prompt using the model's native chat template."""
+    # Use last 10 messages for context
+    messages = [{'role': m['role'], 'content': m['content']} for m in conv[-10:]]
+    # Use tokenizer's chat template (works with Qwen, Llama, Mistral, etc.)
+    try:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        # Fallback if chat template fails
+        parts = []
+        for msg in messages:
+            if msg['role'] == 'user':
+                parts.append(f"User: {msg['content']}")
+            else:
+                parts.append(f"Assistant: {msg['content']}")
+        parts.append('Assistant:')
+        prompt = '\n'.join(parts)
+    return prompt
 
 def _train_step(reward: float):
     """Run one LoRA training step using the last exchange."""
